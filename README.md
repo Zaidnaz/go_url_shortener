@@ -24,7 +24,7 @@ To run this project, you need:
 ## Installation
 
 1. Clone the repository:
-   git clone https://github.com/YOUR_USERNAME/go-url-shortener.git
+   git clone https://github.com/Zaidnaz/go_url_shortener
    cd go-url-shortener
 
 2. Install dependencies:
