@@ -1,82 +1,104 @@
 package main
 
 import (
+	"database/sql"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
-	"sync"
+	"log"
+
+	_ "github.com/mattn/go-sqlite3" // Import the driver
 )
 
-// URLShortener holds our database (a map) and a Mutex.
-// Maps in Go are not thread-safe by default, so we use sync.Mutex
-// to make sure two people don't try to write to the map at the same time.
-type URLShortener struct {
-	urls map[string]string
-	mu   sync.Mutex
+// Link represents our data model
+type Link struct {
+	ID          int    `json:"id"`
+	OriginalURL string `json:"original_url"`
+	ShortCode   string `json:"short_code"`
+	Clicks      int    `json:"clicks"`
 }
+
+var db *sql.DB
 
 func main() {
-	shortener := &URLShortener{
-		urls: make(map[string]string),
+	// 1. Initialize Database
+	var err error
+	db, err = sql.Open("sqlite3", "./links.db")
+	if err != nil {
+		log.Fatal(err)
 	}
+	defer db.Close()
 
-	// Route 1: Shorten a URL
-	// Usage: http://localhost:8080/shorten?url=https://google.com
-	http.HandleFunc("/shorten", shortener.handleShorten)
+	// Create table if it doesn't exist
+	statement, _ := db.Prepare("CREATE TABLE IF NOT EXISTS links (id INTEGER PRIMARY KEY, original_url TEXT, short_code TEXT, clicks INTEGER)")
+	statement.Exec()
 
-	// Route 2: Redirect using the code
-	// Usage: http://localhost:8080/abc123
-	http.HandleFunc("/", shortener.handleRedirect)
+	// 2. Routes
+	http.HandleFunc("/shorten", handleShorten)
+	http.HandleFunc("/", handleRedirect)
 
-	fmt.Println("URL Shortener Server started at :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		fmt.Printf("Error starting server: %s\n", err)
-	}
+	fmt.Println("Pro URL Shortener started at :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// generateCode creates a random 6-character string.
 func generateCode() string {
-	b := make([]byte, 3) // 3 bytes = 6 hex characters
-	if _, err := rand.Read(b); err != nil {
-		return "default"
-	}
+	b := make([]byte, 3)
+	rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
-func (s *URLShortener) handleShorten(w http.ResponseWriter, r *http.Request) {
-	// Get the "url" parameter from the query string
-	longURL := r.URL.Query().Get("url")
-	if longURL == "" {
-		http.Error(w, "Missing 'url' parameter", http.StatusBadRequest)
+func handleShorten(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Generate code and save to map
-	code := generateCode()
-	
-	s.mu.Lock()
-	s.urls[code] = longURL
-	s.mu.Unlock()
+	// Decode JSON request
+	var input struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
 
-	// Respond to the user
-	shortURL := fmt.Sprintf("http://localhost:8080/%s", code)
-	fmt.Fprintf(w, "Shortened URL: %s\n", shortURL)
+	code := generateCode()
+
+	// Insert into Database
+	_, err := db.Exec("INSERT INTO links (original_url, short_code, clicks) VALUES (?, ?, ?)", input.URL, code, 0)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	// Return JSON response
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"short_url": fmt.Sprintf("http://localhost:8080/%s", code),
+	})
 }
 
-func (s *URLShortener) handleRedirect(w http.ResponseWriter, r *http.Request) {
-	// The path will be "/code", so we skip the first character "/"
+func handleRedirect(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Path[1:]
-
-	s.mu.Lock()
-	originalURL, exists := s.urls[code]
-	s.mu.Unlock()
-
-	if !exists {
-		http.Error(w, "URL not found", http.StatusNotFound)
+	if code == "" {
+		fmt.Fprint(w, "Welcome to the Pro Shortener!")
 		return
 	}
 
-	// Perform the redirect
+	var originalURL string
+	var clicks int
+
+	// Query Database & Update Clicks
+	err := db.QueryRow("SELECT original_url, clicks FROM links WHERE short_code = ?", code).Scan(&originalURL, &clicks)
+	if err != nil {
+		http.Error(w, "Link not found", http.StatusNotFound)
+		return
+	}
+
+	// Increment click counter in background
+	db.Exec("UPDATE links SET clicks = ? WHERE short_code = ?", clicks+1, code)
+
 	http.Redirect(w, r, originalURL, http.StatusMovedPermanently)
-}	
+}
